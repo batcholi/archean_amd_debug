@@ -7,7 +7,7 @@
 #endif
 
 // AMD doesn't seem to like ray queries from inside anyhit shaders, comment the line below if you're using an AMD GPU and it crashes
-// #define ENABLE_RAY_QUERIES_FROM_ANYHIT_SHADERS
+#define ENABLE_RAY_QUERIES_FROM_ANYHIT_SHADERS
 
 #include "xenon/renderer/shaders/common.inc.glsl"
 
