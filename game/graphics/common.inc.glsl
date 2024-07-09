@@ -706,7 +706,7 @@ struct RayShadowPayload {
 
 #if defined(SHADER_RAHIT)
 	
-	layout(location = 1) rayPayloadInEXT RayShadowPayload ray;
+	layout(location = 0) rayPayloadInEXT RayShadowPayload ray;
 	
 	void RayTransparent(in vec3 transparency) {
 		ray.colorAttenuation *= transparency;
