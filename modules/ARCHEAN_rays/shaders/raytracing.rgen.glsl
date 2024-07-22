@@ -13,6 +13,8 @@ uint traceRayCount = 0;
 uint glossyRayCount = 0;
 uint nbDirectLights = 0;
 float currentIOR = 1.0;
+float ssao = 1;
+float alpha = 0;
 
 #define NB_LIGHTS 16
 #define SORT_LIGHTS
@@ -35,7 +37,8 @@ vec3 MapUVToSphere(vec2 uv) {
 vec3 GetDirectLighting(in vec3 worldPosition, in vec3 rayDirection, in vec3 normal, in vec3 albedo, in float metallic, in float roughness, in float specular, in float specularHardness) {
 	if ((renderer.options & RENDERER_OPTION_DIRECT_LIGHTING) == 0) return vec3(0);
 	
-	vec3 position = worldPosition + normal * EPSILON * length(worldPosition);
+	float referenceDistance = length(worldPosition - inverse(renderer.viewMatrix)[3].xyz);
+	vec3 position = worldPosition + normal * EPSILON * max(1, referenceDistance);
 	vec3 directLighting = vec3(0);
 	
 	rayQueryEXT q;
@@ -126,7 +129,8 @@ vec3 GetDirectLighting(in vec3 worldPosition, in vec3 rayDirection, in vec3 norm
 			shadowRay.hitDistance = lightsDistance[i] - EPSILON;
 			shadowRay.rayFlags = 0u;
 			++traceRayCount;
-			traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT, RAYTRACE_MASK_SOLID | RAYTRACE_MASK_LIQUID, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, position, 0, shadowRayDir, shadowRay.hitDistance, 1);
+			traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT, RAYTRACE_MASK_TERRAIN, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, position, 0, shadowRayDir, shadowRay.hitDistance, 1);
+			traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT, RAYTRACE_MASK_ENTITY|RAYTRACE_MASK_CLUTTER|RAYTRACE_MASK_LIQUID, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, position, 0, shadowRayDir, shadowRay.hitDistance, 1);
 			vec3 light = lightsColor[i] * lightsPower[i];
 			float NdotL = clamp(dot(normal, shadowRayDir), 0, 1);
 			vec3 diffuse = albedo * NdotL * (1 - metallic) * mix(0.5, 1, roughness);
@@ -147,6 +151,7 @@ void TraceFogRay(in vec3 rayOrigin, in vec3 rayDirection, in float maxDistance, 
 	shadowRay.rayFlags = SHADOW_RAY_FLAG_EMISSION;
 	++traceRayCount;
 	traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT/*flags*/, RAYTRACE_MASK_LIQUID, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, rayOrigin, EPSILON * 100, rayDirection, maxDistance, 1/*payloadIndex*/);
+	++traceRayCount;
 	traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT/*flags*/, RAYTRACE_MASK_FOG, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, rayOrigin, EPSILON * 100, rayDirection, maxDistance, 1/*payloadIndex*/);
 	if (dot(shadowRay.emission, shadowRay.emission) > 0) {
 		imageStore(img_composite, COORDS, vec4(shadowRay.emission * colorFilter, 0) + imageLoad(img_composite, COORDS));
@@ -155,6 +160,8 @@ void TraceFogRay(in vec3 rayOrigin, in vec3 rayDirection, in float maxDistance, 
 }
 
 vec3 TraceAmbientLighting(in vec3 surfaceWorldPosition, in vec3 rayNormal, inout vec3 albedo) {
+	if ((renderer.options & RENDERER_OPTION_RT_AMBIENT_LIGHTING) == 0) return albedo * 0.01 / GetCurrentExposure();
+	
 	// Ambient lighting
 	uint fakeGiSeed = 598734;
 	shadowRay.colorAttenuation = vec3(1);
@@ -164,10 +171,12 @@ vec3 TraceAmbientLighting(in vec3 surfaceWorldPosition, in vec3 rayNormal, inout
 	++traceRayCount;
 	vec3 bounceDirection = normalize(rayNormal + 2.0f * vec3(RandomFloat(fakeGiSeed), RandomFloat(fakeGiSeed), RandomFloat(fakeGiSeed)) - 1.0f);
 	traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT/*flags*/, RAYTRACE_MASK_FOG, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, surfaceWorldPosition, 1000, bounceDirection, shadowRay.hitDistance, 1/*payloadIndex*/);
-	vec3 ambient = shadowRay.emission * albedo * 0.1;
+	vec3 ambient = shadowRay.emission * 0.001;
 	shadowRay.rayFlags = 0;
-	traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT/*flags*/, RAYTRACE_MASK_LIQUID, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, surfaceWorldPosition, 0, bounceDirection, 1, 1/*payloadIndex*/);
-	return ambient * shadowRay.colorAttenuation;
+	shadowRay.hitDistance = 0;
+	++traceRayCount;
+	traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT/*flags*/, RAYTRACE_MASK_LIQUID, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, surfaceWorldPosition, 0, bounceDirection, 0, 1/*payloadIndex*/);
+	return pow(ambient, vec3(0.5)) * albedo * shadowRay.colorAttenuation;
 }
 
 bool TraceGlossyRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 colorFilter) {
@@ -190,6 +199,9 @@ bool TraceGlossyRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 co
 		if (ray.ior == 0) {
 			RayPayload originalRay = ray;
 			float epsilon = clamp(EPSILON * originalRay.hitDistance, EPSILON, 0.1);
+			++traceRayCount;
+			ray.renderableIndex = -1;
+			ray.surfaceFlags = uint8_t(0);
 			traceRayEXT(tlas, gl_RayFlagsCullBackFacingTrianglesEXT|gl_RayFlagsOpaqueEXT/*flags*/, RAYTRACE_MASK_SOLID, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, originalRay.hitDistance - epsilon, rayDirection, originalRay.hitDistance + epsilon, 0/*payloadIndex*/);
 			if (ray.renderableIndex == -1) {
 				ray = originalRay;
@@ -207,7 +219,6 @@ bool TraceGlossyRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 co
 		vec3 rayNormal = ray.normal;
 		vec3 reflectionDir = normalize(reflect(rayDirection, rayNormal));
 		vec3 rayColor = ray.color;
-		float ssao = 1;
 		uint8_t raySurfaceFlags = ray.surfaceFlags;
 		float rayHitDistance = ray.hitDistance;
 		
@@ -216,7 +227,7 @@ bool TraceGlossyRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 co
 		
 		// Direct Lighting (shadows with diffuse and specular lighting)
 		if (raySurfaceFlags == 0/*RAY_SURFACE_DIFFUSE*/ || (roughness > 0 && metallic == 1)) {
-			color += GetDirectLighting(hitWorldPosition, rayDirection, rayNormal, rayColor, metallic, roughness, mix(fresnel, 1.0, metallic), mix(mix(256, 32, roughness), 8, metallic));
+			color += GetDirectLighting(hitWorldPosition, rayDirection, rayNormal, rayColor, metallic, roughness, mix(fresnel*fresnel, 1.0, metallic), mix(64, 8, metallic));
 			color += TraceAmbientLighting(hitWorldPosition, rayNormal, rayColor);
 		}
 		
@@ -225,7 +236,7 @@ bool TraceGlossyRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 co
 		
 		// Write color
 		color *= colorFilter;
-		imageStore(img_composite, COORDS, vec4(color, 1) + imageLoad(img_composite, COORDS));
+		imageStore(img_composite, COORDS, vec4(color, 0) + imageLoad(img_composite, COORDS));
 		
 		if ((raySurfaceFlags & RAY_SURFACE_TRANSPARENT) != 0) {
 			// Refractions
@@ -262,6 +273,9 @@ bool TraceSolidRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 col
 			ray.ior = uint8_t(51);
 			RayPayload originalRay = ray;
 			float epsilon = clamp(EPSILON * originalRay.hitDistance, EPSILON, 0.1);
+			ray.renderableIndex = -1;
+			ray.surfaceFlags = uint8_t(0);
+			++traceRayCount;
 			traceRayEXT(tlas, gl_RayFlagsCullBackFacingTrianglesEXT|gl_RayFlagsOpaqueEXT/*flags*/, RAYTRACE_MASK_SOLID, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, originalRay.hitDistance - epsilon, rayDirection, originalRay.hitDistance + epsilon, 0/*payloadIndex*/);
 			if (ray.renderableIndex == -1) {
 				ray = originalRay;
@@ -280,15 +294,16 @@ bool TraceSolidRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 col
 		vec3 reflectionDir = normalize(reflect(rayDirection, rayNormal));
 		vec3 refractionDir = refract(rayDirection, rayNormal, currentIOR/ior);
 		vec3 rayColor = ray.color;
-		float ssao = 1;
 		uint8_t raySurfaceFlags = ray.surfaceFlags;
 		float rayHitDistance = ray.hitDistance;
+		bool isTransparent = (raySurfaceFlags & RAY_SURFACE_TRANSPARENT) != 0;
 		bool isLiquid = (ray.rayFlags & RAY_FLAG_FLUID) != 0;
 		
 		// Write Motion Vectors
+		bool depthWritten = false;
 		if (imageLoad(img_motion, COORDS).w == 0) {
-			if ((raySurfaceFlags & RAY_SURFACE_TRANSPARENT) == 0 || dot(refractionDir, rayDirection) < 0.5) {
-				if ((ray.rayFlags & RAY_FLAG_FLUID) == 0) {
+			if (!isTransparent || dot(refractionDir, rayDirection) < 0.5) {
+				if (!isLiquid) {
 					mat4 mvp = xenonRendererData.config.projectionMatrix * renderer.viewMatrix * mat4(transpose(renderer.tlasInstances[hitRenderableIndex].transform));
 					renderer.mvpBuffer[hitRenderableIndex].mvp = mvp;
 					renderer.realtimeBuffer[hitRenderableIndex].mvpFrameIndex = xenonRendererData.frameIndex;
@@ -307,6 +322,7 @@ bool TraceSolidRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 col
 					vec4 clipSpace = mat4(xenonRendererData.config.projectionMatrix) * mat4(renderer.viewMatrix) * vec4(hitWorldPosition, 1);
 					float depth = clamp(clipSpace.z / clipSpace.w, 0, 1);
 					imageStore(img_depth, COORDS, vec4(depth));
+					depthWritten = true;
 				}
 			}
 		}
@@ -316,7 +332,7 @@ bool TraceSolidRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 col
 		
 		// Direct Lighting (shadows with diffuse and specular lighting)
 		if (raySurfaceFlags == 0/*RAY_SURFACE_DIFFUSE*/ || (roughness > 0 && metallic == 1)) {
-			color += GetDirectLighting(hitWorldPosition, rayDirection, rayNormal, rayColor, metallic, roughness, mix(fresnel, 1.0, metallic), mix(mix(256, 32, roughness), 8, metallic));
+			color += GetDirectLighting(hitWorldPosition, rayDirection, rayNormal, rayColor, metallic, roughness, mix(fresnel*fresnel, 1.0, metallic), mix(64, 8, metallic));
 			color += TraceAmbientLighting(hitWorldPosition, rayNormal, rayColor);
 		} else if (raySurfaceFlags == RAY_SURFACE_TRANSPARENT && ior > 1) {
 			color += GetDirectLighting(hitWorldPosition, rayDirection, rayNormal, vec3(0), 0, 1, fresnel*fresnel, 64);
@@ -324,48 +340,64 @@ bool TraceSolidRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 col
 		
 		// Fog
 		TraceFogRay(rayOrigin, rayDirection, rayHitDistance, colorFilter);
-		ssao *= max(colorFilter.x, max(colorFilter.y, colorFilter.z));
+		float transparency = max(colorFilter.x, max(colorFilter.y, colorFilter.z));
+		alpha += (isTransparent && !isLiquid)? (1.01 - transparency) : 1;
+		ssao *= clamp(transparency, 0, 1);
 		
 		// Glossy reflections
 		if (roughness == 0 && ior > 1) {
-			vec3 reflectionOrigin = hitWorldPosition + rayNormal * EPSILON * rayHitDistance;
+			bool shouldAim = (ray.rayFlags & RAY_FLAG_AIM) != 0;
+			ray.rayFlags &= ~RAY_FLAG_AIM;
+			vec3 reflectionOrigin = hitWorldPosition + rayNormal * EPSILON * max(rayHitDistance, 1);
 			vec3 reflectionDirection = reflectionDir;
 			vec3 reflectionColorFilter = fresnel * colorFilter;
 			bool reflections = (renderer.options & (isLiquid? RENDERER_OPTION_WATER_REFLECTIONS : RENDERER_OPTION_GLASS_REFLECTIONS)) != 0;
-			if (++glossyRayCount < 3 && (reflections || (raySurfaceFlags & RAY_SURFACE_TRANSPARENT) == 0)) {
-				for (int i = 0; i < 2; i++) {
+			if (++glossyRayCount < 3 && (reflections || !isTransparent)) {
+				for (int i = 0; i < 3; i++) {
 					if (!TraceGlossyRay(reflectionOrigin, reflectionDirection, reflectionColorFilter)) break;
 				}
 			} else if (isLiquid) {
 				TraceFogRay(reflectionOrigin, reflectionDirection, xenonRendererData.config.zFar, reflectionColorFilter);
 			}
 			ray.rayFlags &= ~RAY_FLAG_FLUID;
+			if (shouldAim) ray.rayFlags |= RAY_FLAG_AIM;
 		}
 		
 		// Write color
 		color *= colorFilter;
-		imageStore(img_composite, COORDS, vec4(color, 1) + imageLoad(img_composite, COORDS));
-		imageStore(img_normal_or_debug, COORDS, vec4(rayNormal, ssao));
+		imageStore(img_composite, COORDS, vec4(color, alpha) + imageLoad(img_composite, COORDS));
 		
-		if ((raySurfaceFlags & RAY_SURFACE_TRANSPARENT) != 0) {
+		// SSAO
+		if (depthWritten) {
+			imageStore(img_normal_or_debug, COORDS, vec4(rayNormal, ssao));
+		}
+		
+		if (isTransparent) {
 			// Refraction
 			bool refraction = (renderer.options & (isLiquid? RENDERER_OPTION_WATER_REFRACTION : RENDERER_OPTION_GLASS_REFRACTION)) != 0;
 			if (refraction || (isLiquid && ior < 1)) {
 				rayDirection = refractionDir;
 				if (dot(rayDirection, rayDirection) == 0) {
 					rayDirection = reflectionDir;
+					rayOrigin = hitWorldPosition + rayNormal * EPSILON * max(rayHitDistance * 0.01, 1);
+					alpha = 1;
 				} else {
 					currentIOR = ior;
+					rayOrigin = hitWorldPosition - rayNormal * EPSILON * max(rayHitDistance * 0.01, 1);
 				}
+			} else {
+				rayOrigin = hitWorldPosition - rayNormal * EPSILON * max(rayHitDistance * 0.01, 1);
 			}
 		} else if (metallic != 0 && roughness == 0) {
 			// Metallic reflections
 			rayDirection = reflectionDir;
+			rayOrigin = hitWorldPosition + rayNormal * EPSILON * max(rayHitDistance * 0.01, 1);
+			alpha = 1;
 		} else {
 			return false;
 		}
 		colorFilter *= rayColor * 0.9/*bounce attenuation*/;
-		rayOrigin = hitWorldPosition + rayDirection * EPSILON;
+		rayOrigin += rayDirection * EPSILON;
 		return true;
 	}
 }
